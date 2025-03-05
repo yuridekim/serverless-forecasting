@@ -10,8 +10,6 @@ with open("entry.py", "r") as src_file:
 
 @app.route('/')
 def run():
-    # TODO: tell redis execution began
-
     lambda_globals = {
         "__name__": "__serverless__"
     }
@@ -20,8 +18,6 @@ def run():
 
     if "__serverless_ret__" not in lambda_globals:
         raise Exception("Function completed execution without setting __serverless_ret__")
-
-    # TODO: tell redis execution ended
 
     return lambda_globals["__serverless_ret__"]
 
