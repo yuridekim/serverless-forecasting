@@ -78,27 +78,31 @@ class ServerlessPlatform:
     _docker_client: docker.DockerClient
     _threadpool: concurrent.futures.ThreadPoolExecutor  # thread pool to run functions simultaneously
     _template_path: str  # Path to Docker template (usually in a directory called template)
-    _functions: ThreadSafeDict[str, str]  # Mapping from function name to image name
-    _num_instances: ThreadSafeDict[str, int]  # Mapping from function name to number of warmed or running containers
+    _image_names: ThreadSafeDict[str, str]  # Mapping from function name to image name
+    _default_warm_periods: ThreadSafeDict[str, int]  # Default warming period (s) for a non-permanently-warmed container
+    _instance_expirations: ThreadSafeDict[str, dict[str, int]]  # Mapping from function to the expiration timestamps
     _available_instances: ThreadSafeDict[str, list[str]]  # Mapping from function name to available container names
-    _min_instances: ThreadSafeDict[str, int]  # Set through set_concurrent_warm_instances
 
-    def __init__(self, template_path: str = "template/"):
+    def __init__(self, template_path: str = "sf_platform/template/"):
         self._docker_client_lock = threading.Lock()
         self._docker_client = docker.from_env()
         self._threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=256)
         self._template_path = template_path
-        self._functions = ThreadSafeDict()  # TODO persistence of image names?
+        self._image_names = ThreadSafeDict()  # TODO persistence of image names?
+        self._default_warm_periods = ThreadSafeDict()
         # TODO: per-function granularity on lock? (up to you)
-        self._num_instances = ThreadSafeDict()
+        self._instance_expirations = ThreadSafeDict()
         self._available_instances = ThreadSafeDict()
-        self._min_instances = ThreadSafeDict()
+
+        asyncio.create_task(self._prune())  # begin the pruning loop
 
     def __del__(self):
+        # TODO delete all containers (expired or not) in _instance_expirations
+
         with self._docker_client_lock:
-            for image_name in self._functions.values():
-                self._docker_client.images.remove(image=image_name)
-        # TODO delete containers
+            with self._image_names as image_names:
+                for image_name in image_names.values():
+                    self._docker_client.images.remove(image=image_name)
 
     async def register_function(self, function_name: str, python_file: str, requirements_file: str) -> None:
         loop = asyncio.get_running_loop()
@@ -112,7 +116,7 @@ class ServerlessPlatform:
 
     def _register_function(self, function_name: str, python_file: str, requirements_file: str) -> None:
         function_name = function_name.strip()
-        if len(function_name.split()) != 1 or function_name in self._functions:
+        if len(function_name.split()) != 1 or function_name in self._image_names:
             raise Exception("Invalid function name")
 
         with tempfile.TemporaryDirectory() as docker_dir:
@@ -124,20 +128,21 @@ class ServerlessPlatform:
             with self._docker_client_lock:
                 image, logs = self._docker_client.images.build(
                     path=docker_dir,
-                    tag=image_name
+                    tag=image_name,
+                    rm=True  # remove intermediate containers made during the creation of the image
                 )
 
-            with self._functions as functions:
-                functions[function_name] = image_name
+            with self._image_names as image_names:
+                image_names[function_name] = image_name
+
+            with self._default_warm_periods as default_warm_periods:
+                default_warm_periods[function_name] = 600  # 10 minutes
 
             with self._available_instances as available_instances:
                 available_instances[function_name] = list()
 
-            with self._num_instances as num_instances:
-                num_instances[function_name] = 0
-
-            with self._min_instances as min_instances:
-                self._min_instances[function_name] = 0
+            with self._instance_expirations as instance_expirations:
+                instance_expirations[function_name] = dict()
 
     async def run_function(self, function_name: str,
                            method: str = "GET", headers: Optional[dict[str, str]] = None, data: str = "", query_params: Optional[str] = None
@@ -145,9 +150,7 @@ class ServerlessPlatform:
         """
         If there is a warm instance (container) available, directly curl
 
-        If not, create a new container, then curl
-
-        curl -X {method} -H {header} -d '{data}' http://localhost:<port>/?{query_params}
+        If not, create a new container, then send a request
         """
         
         # TODO: add tracing (function entry time right here)
@@ -168,24 +171,10 @@ class ServerlessPlatform:
     def _run_function(self, function_name: str,
                       method: str, headers: Optional[dict[str, str]], data: str, query_params: Optional[str]) -> bytes:
         function_name = function_name.strip()
-        if function_name not in self._functions:
+        if function_name not in self._image_names:
             raise Exception("Function not found")
 
-        # TODO: check if there is a warm instance available (using _available_instances)
-        # (for now, i assume it doesn't exist and create a new one)
-
-        host_port = random.randint(49152, 65535)
-        container_name = f"serverless_{function_name}_{host_port}"
-
-        with self._docker_client_lock:
-            container = self._docker_client.containers.run(
-                image=self._functions[function_name],
-                detach=True,
-                name=container_name,
-                ports={'80/tcp': host_port},  # random host port (None) is not working :(, manually choose a random port
-                auto_remove=True,  # when Flask is stopped, remove the container (we never restart stopped containers)
-            )
-        # host_port = container.attrs['HostConfig']['PortBindings']['80/tcp'][0]['HostPort']
+        host_port, container_name = self._get_container(function_name)
 
         full_url = f"http://localhost:{host_port}/"
         if query_params is not None:
@@ -198,27 +187,116 @@ class ServerlessPlatform:
             data
         )
 
-        # TODO: do not always delete the container
-        with self._docker_client_lock:
-            container.stop(timeout=3)
+        self._return_container(function_name, container_name)
 
         if not response:
             raise Exception("Attempts to request data failed")
         return response.content
 
-    def set_concurrent_warm_instances(self, function_name: str, num_concurrent: int) -> None:
+    def _get_container(self, function_name: str) -> tuple[int, str]:
+        """
+        Get a container used to run the function. If one is not immediately available, create a new one.
+        """
+        available_instance = None
+        with self._available_instances as available_instances:
+            instances = available_instances[function_name]
+            if len(instances) > 0:
+                available_instance = instances.pop()
+
+        if available_instance is not None:
+            host_port = int(available_instance.split("_")[2])  # third part of the name is the port number
+            return host_port, available_instance
+
+        # a new container made through get_container is not a permanently-warmed instance, use default expiration
+        with self._default_warm_periods as default_warm_periods:
+            warm_period = default_warm_periods[function_name]
+        expiration = int(time.time()) + warm_period if warm_period > 0 else -1
+
+        return self._create_new_container(function_name, expiration)
+
+    def _return_container(self, function_name: str, container_name: str):
+        """
+        Tell the datastructure the container is available to be used again
+        """
+        # Renew the timeout
+        with self._default_warm_periods as default_warm_periods:
+            warm_period = default_warm_periods[function_name]
+
+        with self._instance_expirations as instance_expirations:
+            expiration = instance_expirations[function_name][container_name]
+            if expiration > 0:
+                instance_expirations[function_name][container_name] = (int(time.time()) + warm_period
+                                                                       if warm_period > 0 else -1)
+
+        with self._available_instances as available_instances:
+            available_instances[function_name].append(container_name)
+
+    def _create_new_container(self, function_name: str, expiration: int) -> tuple[int, str]:
+        """
+        Create a new docker container, return its host port and container name
+        """
+        # get a container name with a unique port
+        with self._instance_expirations as instance_expirations:
+            while True:
+                host_port = random.randint(49152, 65535)
+                container_name = f"serverless_{function_name}_{host_port}"
+                if container_name not in instance_expirations[function_name]:
+                    break
+
+        with self._docker_client_lock:
+            container = self._docker_client.containers.run(
+                image=self._image_names[function_name],
+                detach=True,
+                name=container_name,
+                ports={'80/tcp': host_port},
+                auto_remove=True,  # when Flask is stopped, remove the container (we never restart stopped containers)
+            )
+
+        with self._instance_expirations as instance_expirations:
+            instance_expirations[function_name][container_name] = expiration
+
+        return host_port, container_name
+
+    async def set_permanently_warm_instances(self, function_name: str, num_concurrent: int) -> None:
         """
         Sets the minimum number of warm instances for a function at any given time
         """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._threadpool,
+            self._set_permanently_warm_instances,
+            function_name, num_concurrent
+        )
+
+        await future
+
+    def _set_permanently_warm_instances(self, function_name: str, num_concurrent: int) -> None:
         function_name = function_name.strip()
-        if function_name not in self._functions:
+        if function_name not in self._image_names:
             raise Exception("Function not found")
 
-        with self._min_instances as min_instances:
-            min_instances[function_name] = num_concurrent
-        # TODO: implement the function (check _num_instances, create new instances as necessary)
+        # TODO: implement the function
+        # check _instance_expirations for the number of instances that have expiration -1 (permanently warmed instance)
+        # if there are not enough: create new instances (with expiration -1) as necessary
+        # if there are too many: set an expiration of int(time.time()) for some of the instances
 
     async def _prune(self):
+        await asyncio.sleep(5)
+
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._threadpool,
+            self.__prune
+        )
+
+        await future
+
+        asyncio.create_task(self._prune())
+
+    def __prune(self) -> None:
         # TODO: implement this function
-        # loop through the functions, check if _num_isntances exceeds _min_instances, if so, prune some available instances
+        # loop through the functions, and inner loop through the instances (you can use _instance_expirations for this)
+        # if an instance's timestamp is not -1 (warm forever) and also in the past:
+        #   call stop() on the container (which will automatically delete it)
+        #   have a guard to NOT stop any containers that are currently unavailable
         pass
