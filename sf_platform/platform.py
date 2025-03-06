@@ -243,6 +243,8 @@ class ServerlessPlatform:
                 if container_name not in instance_expirations[function_name]:
                     break
 
+            instance_expirations[function_name][container_name] = expiration
+
         with self._docker_client_lock:
             container = self._docker_client.containers.run(
                 image=self._image_names[function_name],
@@ -251,9 +253,6 @@ class ServerlessPlatform:
                 ports={'80/tcp': host_port},
                 auto_remove=True,  # when Flask is stopped, remove the container (we never restart stopped containers)
             )
-
-        with self._instance_expirations as instance_expirations:
-            instance_expirations[function_name][container_name] = expiration
 
         return host_port, container_name
 
