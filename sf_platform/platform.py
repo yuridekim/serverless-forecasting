@@ -210,7 +210,7 @@ class ServerlessPlatform:
         # a new container made through get_container is not a permanently-warmed instance, use default expiration
         with self._default_warm_periods as default_warm_periods:
             warm_period = default_warm_periods[function_name]
-        expiration = int(time.time()) + warm_period if warm_period > 0 else -1
+        expiration = int(time.time()) + warm_period if warm_period >= 0 else -1
 
         return self._create_new_container(function_name, expiration)
 
@@ -222,14 +222,22 @@ class ServerlessPlatform:
         with self._default_warm_periods as default_warm_periods:
             warm_period = default_warm_periods[function_name]
 
+        should_remove_container = False
         with self._instance_expirations as instance_expirations:
             expiration = instance_expirations[function_name][container_name]
-            if expiration > 0:
+            if expiration > 0 and warm_period == 0:
+                # Special handling for no-keep-warm, regular expirations are caught through _prune
+                should_remove_container = True
+                del instance_expirations[function_name][container_name]
+            elif expiration > 0:
                 instance_expirations[function_name][container_name] = (int(time.time()) + warm_period
-                                                                       if warm_period > 0 else -1)
+                                                                       if warm_period >= 0 else -1)
 
-        with self._available_instances as available_instances:
-            available_instances[function_name].append(container_name)
+        if should_remove_container:
+            self._delete_container(container_name)
+        else:
+            with self._available_instances as available_instances:
+                available_instances[function_name].append(container_name)
 
     def _create_new_container(self, function_name: str, expiration: int) -> tuple[int, str]:
         """
@@ -310,6 +318,10 @@ class ServerlessPlatform:
             for instance_name, expiration in instance_expiration_dict.items():
                 if expiration > 0:
                     instance_expiration_dict[instance_name] += difference
+
+    def _delete_container(self, container_name: str) -> None:
+        with self._docker_client_lock:
+            self._docker_client.containers.get(container_name).stop(timeout=3)
 
     async def _prune(self):
         await asyncio.sleep(5)
