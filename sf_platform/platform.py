@@ -280,6 +280,38 @@ class ServerlessPlatform:
         # if there are not enough: create new instances (with expiration -1) as necessary
         # if there are too many: set an expiration of int(time.time()) for some of the instances
 
+    async def set_default_warm_period(self, function_name: str, warm_period: int) -> None:
+        """
+        Set default warm period for a function (seconds)
+        """
+        loop = asyncio.get_running_loop()
+        future = loop.run_in_executor(
+            self._threadpool,
+            self._set_default_warm_period,
+            function_name, warm_period
+        )
+
+        await future
+
+    def _set_default_warm_period(self, function_name: str, warm_period: int) -> None:
+        function_name = function_name.strip()
+        if function_name not in self._image_names:
+            raise Exception("Function not found")
+
+        with self._default_warm_periods as default_warm_periods:
+            prev_warm_period = default_warm_periods[function_name]
+            default_warm_periods[function_name] = warm_period
+
+        difference = warm_period - prev_warm_period
+        if difference == 0:
+            return
+
+        with self._instance_expirations as instance_expirations:
+            instance_expiration_dict = instance_expirations[function_name]
+            for instance_name, expiration in instance_expiration_dict.items():
+                if expiration > 0:
+                    instance_expiration_dict[instance_name] += difference
+
     async def _prune(self):
         await asyncio.sleep(5)
 
