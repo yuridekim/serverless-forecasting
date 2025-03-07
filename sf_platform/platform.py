@@ -98,6 +98,9 @@ class ServerlessPlatform:
         asyncio.create_task(self._prune())  # begin the pruning loop
 
     def __del__(self):
+        self.shutdown()
+
+    def shutdown(self):
         # Delete all containers (expired or not) in _instance_expirations
         all_containers = []
         with self._instance_expirations as instance_expirations:
@@ -119,7 +122,7 @@ class ServerlessPlatform:
 
             for image_name in all_images:
                 try:
-                    self._docker_client.images.remove(image=image_name)
+                    self._docker_client.images.remove(image=image_name, force=True)
                 except docker.errors.ImageNotFound:
                     pass
 
