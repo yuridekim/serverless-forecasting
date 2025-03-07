@@ -74,7 +74,7 @@ def retry_request(method: str, url: str,
 
 
 class ServerlessPlatform:
-    _docker_client_lock = threading.Lock  # TODO: do we need this? (up to you)
+    _docker_client_lock = threading.Lock()
     _docker_client: docker.DockerClient
     _threadpool: concurrent.futures.ThreadPoolExecutor  # thread pool to run functions simultaneously
     _template_path: str  # Path to Docker template (usually in a directory called template)
@@ -82,6 +82,7 @@ class ServerlessPlatform:
     _default_warm_periods: ThreadSafeDict[str, int]  # Default warming period (s) for a non-permanently-warmed container
     _instance_expirations: ThreadSafeDict[str, dict[str, int]]  # Mapping from function to the expiration timestamps
     _available_instances: ThreadSafeDict[str, list[str]]  # Mapping from function name to available container names
+    _function_times: ThreadSafeDict[str, dict[str, float]] # dictionary for execution times
 
     def __init__(self, template_path: str = "sf_platform/template/"):
         self._docker_client_lock = threading.Lock()
@@ -90,19 +91,31 @@ class ServerlessPlatform:
         self._template_path = template_path
         self._image_names = ThreadSafeDict()  # TODO persistence of image names?
         self._default_warm_periods = ThreadSafeDict()
-        # TODO: per-function granularity on lock? (up to you)
         self._instance_expirations = ThreadSafeDict()
         self._available_instances = ThreadSafeDict()
+        self._function_times = ThreadSafeDict()
 
         asyncio.create_task(self._prune())  # begin the pruning loop
 
     def __del__(self):
-        # TODO delete all containers (expired or not) in _instance_expirations
-
+        # Delete all containers (expired or not) in _instance_expirations
         with self._docker_client_lock:
+            with self._instance_expirations as instance_expirations:
+                for _, container_dict in instance_expirations.items():
+                    for container_name in container_dict.keys():
+                        try:
+                            container = self._docker_client.containers.get(container_name)
+                            container.stop(timeout=3)
+                        except docker.errors.NotFound:
+                            # Container might already be removed
+                            pass
+
             with self._image_names as image_names:
                 for image_name in image_names.values():
-                    self._docker_client.images.remove(image=image_name)
+                    try:
+                        self._docker_client.images.remove(image=image_name)
+                    except docker.errors.ImageNotFound:
+                        pass
 
     async def register_function(self, function_name: str, python_file: str, requirements_file: str) -> None:
         loop = asyncio.get_running_loop()
@@ -126,7 +139,7 @@ class ServerlessPlatform:
 
             image_name = f"serverless/{function_name}"
             with self._docker_client_lock:
-                image, logs = self._docker_client.images.build(
+                _, _ = self._docker_client.images.build(
                     path=docker_dir,
                     tag=image_name,
                     rm=True  # remove intermediate containers made during the creation of the image
@@ -143,6 +156,9 @@ class ServerlessPlatform:
 
             with self._instance_expirations as instance_expirations:
                 instance_expirations[function_name] = dict()
+                
+            with self._function_times as function_times:
+                function_times[function_name] = {}
 
     async def run_function(self, function_name: str,
                            method: str = "GET", headers: Optional[dict[str, str]] = None, data: str = "", query_params: Optional[str] = None
@@ -153,18 +169,26 @@ class ServerlessPlatform:
         If not, create a new container, then send a request
         """
         
-        # TODO: add tracing (function entry time right here)
+        # add tracing for function entry time
+        request_id = f"{function_name}_{time.time()}_{random.randint(0, 10000)}"
+        with self._function_times as function_times:
+            function_times[function_name][request_id] = time.time()
         
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(
             self._threadpool,
             self._run_function,
-            function_name, method, headers, data, query_params
-        )
+            function_name, method, headers, data, query_params)
 
         result = await future
         
-        # TODO: add tracing (function exit time right here)
+        # add tracing for function exit time
+        with self._function_times as function_times:
+            exit_time = time.time()
+            entry_time = function_times[function_name].pop(request_id, None)
+            if entry_time:
+                exec_time = exit_time - entry_time
+                print(f"Function {function_name} execution time: {exec_time:.4f}s (request ID: {request_id})")
         
         return result
 
@@ -254,7 +278,7 @@ class ServerlessPlatform:
             instance_expirations[function_name][container_name] = expiration
 
         with self._docker_client_lock:
-            container = self._docker_client.containers.run(
+            _ = self._docker_client.containers.run(
                 image=self._image_names[function_name],
                 detach=True,
                 name=container_name,
@@ -282,10 +306,44 @@ class ServerlessPlatform:
         if function_name not in self._image_names:
             raise Exception("Function not found")
 
-        # TODO: implement the function
-        # check _instance_expirations for the number of instances that have expiration -1 (permanently warmed instance)
-        # if there are not enough: create new instances (with expiration -1) as necessary
-        # if there are too many: set an expiration of int(time.time()) for some of the instances
+        # Implementation for permanent warm instances
+        warm_cnt = 0
+        container_names = []
+        
+        # Count current permanently warm instances
+        with self._instance_expirations as instance_expirations:
+            function_instances = instance_expirations[function_name]
+            for container_name, expiration in function_instances.items():
+                if expiration == -1:
+                    warm_cnt += 1
+                    container_names.append(container_name)
+        
+        if warm_cnt < num_concurrent:
+            instances_to_create = num_concurrent - warm_cnt
+            for _ in range(instances_to_create):
+                # make new permanently warm instances
+                _, container_name = self._create_new_container(function_name, -1)
+                with self._available_instances as available_instances:
+                    available_instances[function_name].append(container_name)
+        
+        # in case of too many instances
+        elif warm_cnt > num_concurrent:
+            instances_to_expire = warm_cnt - num_concurrent
+            
+            # Set expiration
+            with self._instance_expirations as instance_expirations:
+                function_instances = instance_expirations[function_name]
+                expired_count = 0
+                
+                for container_name in container_names:
+                    if expired_count >= instances_to_expire:
+                        break
+                    
+                    # check if container is in use
+                    with self._available_instances as available_instances:
+                        if container_name in available_instances[function_name]:
+                            function_instances[container_name] = int(time.time())
+                            expired_count += 1
 
     async def set_default_warm_period(self, function_name: str, warm_period: int) -> None:
         """
@@ -321,7 +379,10 @@ class ServerlessPlatform:
 
     def _delete_container(self, container_name: str) -> None:
         with self._docker_client_lock:
-            self._docker_client.containers.get(container_name).stop(timeout=3)
+            try:
+                self._docker_client.containers.get(container_name).stop(timeout=3)
+            except docker.errors.NotFound:
+                pass
 
     async def _prune(self):
         await asyncio.sleep(5)
@@ -337,9 +398,27 @@ class ServerlessPlatform:
         asyncio.create_task(self._prune())
 
     def __prune(self) -> None:
-        # TODO: implement this function
-        # loop through the functions, and inner loop through the instances (you can use _instance_expirations for this)
-        # if an instance's timestamp is not -1 (warm forever) and also in the past:
-        #   call stop() on the container (which will automatically delete it)
-        #   have a guard to NOT stop any containers that are currently unavailable
-        pass
+        current_time = int(time.time())
+        containers_to_delete = []
+        
+        # Find expired containers
+        with self._instance_expirations as instance_expirations:
+            for function_name, container_dict in instance_expirations.items():
+                to_delete_from_function = []
+                
+                for container_name, expiration in container_dict.items():
+                    # check if expired
+                    if expiration > 0 and expiration < current_time:
+                        with self._available_instances as available_instances:
+                            if container_name in available_instances[function_name]:
+                                containers_to_delete.append(container_name)
+                                to_delete_from_function.append(container_name)
+                                # rmove from available instances
+                                available_instances[function_name].remove(container_name)
+                
+                # remove expired containers from instance_expirations
+                for container_name in to_delete_from_function:
+                    del container_dict[container_name]
+        
+        for container_name in containers_to_delete:
+            self._delete_container(container_name)
