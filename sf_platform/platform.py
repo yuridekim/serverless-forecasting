@@ -322,10 +322,17 @@ class ServerlessPlatform:
         # Count current permanently warm instances
         with self._instance_expirations as instance_expirations:
             function_instances = instance_expirations[function_name]
+            containers_to_convert = []  # Non-permanent containers to convert to permanent (save work)
             for container_name, expiration in function_instances.items():
                 if expiration == -1:
                     warm_cnt += 1
                     container_names.append(container_name)
+                else:
+                    containers_to_convert.append(container_name)
+
+            while warm_cnt < num_concurrent and containers_to_convert:
+                function_instances[containers_to_convert.pop()] = -1
+                warm_cnt += 1
         
         if warm_cnt < num_concurrent:
             instances_to_create = num_concurrent - warm_cnt
