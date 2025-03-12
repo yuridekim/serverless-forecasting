@@ -77,6 +77,7 @@ def retry_request(method: str, url: str,
 
 
 class ServerlessPlatform:
+    _time_multiplier: float  # Wall-clock speed for the serverless platform, affects prune interval and warm periods
     _docker_client_lock = threading.Lock
     _docker_client: docker.DockerClient
     _threadpool: concurrent.futures.ThreadPoolExecutor  # thread pool to run functions simultaneously
@@ -88,7 +89,9 @@ class ServerlessPlatform:
     _logger: logging.Logger  # Logger for tracing
     _logging_queue_listener: QueueListener  # Queue handler for logger
 
-    def __init__(self, template_path: str = "sf_platform/template/"):
+    def __init__(self, template_path: str = "sf_platform/template/", time_multiplier: float = 1.0):
+        self._time_multiplier = time_multiplier
+
         self._docker_client_lock = threading.Lock()
         self._docker_client = docker.from_env()
         self._threadpool = concurrent.futures.ThreadPoolExecutor(max_workers=256)
@@ -174,7 +177,7 @@ class ServerlessPlatform:
                 image_names[function_name] = image_name
 
             with self._default_warm_periods as default_warm_periods:
-                default_warm_periods[function_name] = 600  # 10 minutes
+                default_warm_periods[function_name] = int(600 // self._time_multiplier)  # 10 minutes
 
             with self._available_instances as available_instances:
                 available_instances[function_name] = list()
@@ -396,6 +399,8 @@ class ServerlessPlatform:
         if function_name not in self._image_names:
             raise Exception("Function not found")
 
+        warm_period = int(warm_period // self._time_multiplier)
+
         with self._default_warm_periods as default_warm_periods:
             prev_warm_period = default_warm_periods[function_name]
             default_warm_periods[function_name] = warm_period
@@ -418,7 +423,7 @@ class ServerlessPlatform:
                 pass
 
     async def _prune(self):
-        await asyncio.sleep(5)
+        await asyncio.sleep(5 / self._time_multiplier)
 
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(
