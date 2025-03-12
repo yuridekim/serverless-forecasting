@@ -8,6 +8,7 @@ if __name__ == "__serverless__":
     if "=" in query_params:
         sleep_time = float(query_params.split("=")[1])
 
+    print("SLEEPING!", flush=True)
     time.sleep(sleep_time)
 
     global __serverless_ret__

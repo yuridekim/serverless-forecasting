@@ -1,9 +1,12 @@
+import logging
+logging.getLogger("prophet.plot").disabled = True
 from prophet import Prophet
 from datetime import datetime, timedelta
+from sf_platform import ServerlessPlatform
 import pandas as pd
 
 class ServerlessScheduler:
-    def __init__(self, platform, models, interval=10, default_warm_instances=0, default_warm_period=30):
+    def __init__(self, platform: ServerlessPlatform, models: dict[str, Prophet], interval=10, default_warm_instances=0, default_warm_period=30):
         """
         platform: Instance of ServerlessPlatform
         models: Map function names to Prophet models.
@@ -35,10 +38,11 @@ class ServerlessScheduler:
             print(f"Error generating predictions: {e}")
             return None
 
-    def adjust_scheduling(self):
+    async def adjust_scheduling(self):
         """Adjust scheduling based on Prophet model predictions."""
         for func_name, model in self.models.items():
             predictions = self.get_predictions(model)
+            print("PREDICTIONS:", predictions)
 
             if predictions is None or predictions.empty:
                 # Fallback keep-alive policy
@@ -57,5 +61,5 @@ class ServerlessScheduler:
             active_seconds = [ds for ds, count in invocation_counts.items() if count > 0]
             warm_period = int((max(active_seconds) - min(active_seconds)).total_seconds()) + 1 if active_seconds else 0
 
-            self.platform.set_permanently_warm_instances(func_name, permanently_warm_instances)
-            self.platform.set_default_warm_period(func_name, warm_period)
+            await self.platform.set_permanently_warm_instances(func_name, permanently_warm_instances)
+            await self.platform.set_default_warm_period(func_name, warm_period)

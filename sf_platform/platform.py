@@ -143,7 +143,7 @@ class ServerlessPlatform:
                 except docker.errors.ImageNotFound:
                     pass
 
-        self._logging_queue_listener.stop()
+        # self._logging_queue_listener.stop() # TODO: this has some issues (logging_queue_listener is NoneType?) i think race condition
 
     async def register_function(self, function_name: str, python_file: str, requirements_file: str) -> None:
         loop = asyncio.get_running_loop()
