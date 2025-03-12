@@ -8,6 +8,9 @@ import shutil
 import tempfile
 import threading
 import time
+import logging
+import queue
+from logging.handlers import QueueHandler, QueueListener
 from distutils.dir_util import copy_tree
 from typing import Any, Optional
 
@@ -82,7 +85,8 @@ class ServerlessPlatform:
     _default_warm_periods: ThreadSafeDict[str, int]  # Default warming period (s) for a non-permanently-warmed container
     _instance_expirations: ThreadSafeDict[str, dict[str, int]]  # Mapping from function to the expiration timestamps
     _available_instances: ThreadSafeDict[str, list[str]]  # Mapping from function name to available container names
-    _function_times: ThreadSafeDict[str, dict[str, float]] # dictionary for execution times
+    _logger: logging.Logger  # Logger for tracing
+    _logging_queue_listener: QueueListener  # Queue handler for logger
 
     def __init__(self, template_path: str = "sf_platform/template/"):
         self._docker_client_lock = threading.Lock()
@@ -93,7 +97,17 @@ class ServerlessPlatform:
         self._default_warm_periods = ThreadSafeDict()
         self._instance_expirations = ThreadSafeDict()
         self._available_instances = ThreadSafeDict()
-        self._function_times = ThreadSafeDict()
+
+        self._logger = logging.getLogger("ServerlessPlatform")
+        self._logger.setLevel(logging.INFO)
+
+        log_queue = queue.Queue()
+        queue_handler = QueueHandler(log_queue)
+        self._logger.addHandler(queue_handler)
+
+        stream_handler = logging.StreamHandler()  # Writes to stdout
+        self._logging_queue_listener = QueueListener(log_queue, stream_handler)
+        self._logging_queue_listener.start()
 
         asyncio.create_task(self._prune())  # begin the pruning loop
 
@@ -125,6 +139,8 @@ class ServerlessPlatform:
                     self._docker_client.images.remove(image=image_name, force=True)
                 except docker.errors.ImageNotFound:
                     pass
+
+        self._logging_queue_listener.stop()
 
     async def register_function(self, function_name: str, python_file: str, requirements_file: str) -> None:
         loop = asyncio.get_running_loop()
@@ -165,9 +181,6 @@ class ServerlessPlatform:
 
             with self._instance_expirations as instance_expirations:
                 instance_expirations[function_name] = dict()
-                
-            with self._function_times as function_times:
-                function_times[function_name] = {}
 
     async def run_function(self, function_name: str,
                            method: str = "GET", headers: Optional[dict[str, str]] = None, data: str = "", query_params: Optional[str] = None
@@ -177,12 +190,6 @@ class ServerlessPlatform:
 
         If not, create a new container, then send a request
         """
-        
-        # add tracing for function entry time
-        request_id = f"{function_name}_{time.time()}_{random.randint(0, 10000)}"
-        with self._function_times as function_times:
-            function_times[function_name][request_id] = time.time()
-        
         loop = asyncio.get_running_loop()
         future = loop.run_in_executor(
             self._threadpool,
@@ -190,24 +197,25 @@ class ServerlessPlatform:
             function_name, method, headers, data, query_params)
 
         result = await future
-        
-        # add tracing for function exit time
-        with self._function_times as function_times:
-            exit_time = time.time()
-            entry_time = function_times[function_name].pop(request_id, None)
-            if entry_time:
-                exec_time = exit_time - entry_time
-                print(f"Function {function_name} execution time: {exec_time:.4f}s (request ID: {request_id})")
-        
+
         return result
 
     def _run_function(self, function_name: str,
                       method: str, headers: Optional[dict[str, str]], data: str, query_params: Optional[str]) -> bytes:
+        run_properties = dict()
+        run_properties["log_type"] = "invocation_trace"
+        run_properties["function_name"] = function_name
+        run_properties["entry_time"] = time.time()
+        run_properties["request_id"] = f'{function_name}_{method}_{run_properties["entry_time"]}'
+
         function_name = function_name.strip()
         if function_name not in self._image_names:
             raise Exception("Function not found")
 
-        host_port, container_name = self._get_container(function_name)
+        host_port, container_name, cold_start = self._get_container(function_name)
+
+        run_properties["container_acquire_time"] = time.time()
+        run_properties["cold_start"] = cold_start
 
         full_url = f"http://localhost:{host_port}/"
         if query_params is not None:
@@ -220,15 +228,22 @@ class ServerlessPlatform:
             data
         )
 
+        run_properties["response_time"] = time.time()
+
         self._return_container(function_name, container_name)
+        run_properties["container_release_time"] = time.time()
+
+        self._logger.info(run_properties)
 
         if not response:
             raise Exception("Attempts to request data failed")
         return response.content
 
-    def _get_container(self, function_name: str) -> tuple[int, str]:
+    def _get_container(self, function_name: str) -> tuple[int, str, bool]:
         """
         Get a container used to run the function. If one is not immediately available, create a new one.
+
+        Returns host port, container name, whether is cold start (was a new container created)
         """
         available_instance = None
         with self._available_instances as available_instances:
@@ -238,14 +253,14 @@ class ServerlessPlatform:
 
         if available_instance is not None:
             host_port = int(available_instance.split("_")[2])  # third part of the name is the port number
-            return host_port, available_instance
+            return host_port, available_instance, False
 
         # a new container made through get_container is not a permanently-warmed instance, use default expiration
         with self._default_warm_periods as default_warm_periods:
             warm_period = default_warm_periods[function_name]
         expiration = int(time.time()) + warm_period if warm_period >= 0 else -1
 
-        return self._create_new_container(function_name, expiration)
+        return self._create_new_container(function_name, expiration) + (True, )
 
     def _return_container(self, function_name: str, container_name: str):
         """
@@ -416,16 +431,27 @@ class ServerlessPlatform:
         asyncio.create_task(self._prune())
 
     def __prune(self) -> None:
+        prune_properties = dict()
+        prune_properties["log_type"] = "prune_info"
+        prune_properties["entry_time"] = time.time()
+
         current_time = int(time.time())
         containers_to_delete = []
+
+        pruned_count = dict()  # number of pruned containers per function
+        remaining_count = dict()  # number of remaining containers per function
 
         # Find expired containers
         with self._instance_expirations as instance_expirations:
             for function_name, container_dict in instance_expirations.items():
+                pruned_count[function_name] = 0
+                remaining_count[function_name] = 0
                 for container_name, expiration in container_dict.items():
                     # check if expired
                     if 0 < expiration < current_time:
                         containers_to_delete.append((function_name, container_name))
+
+                    remaining_count[function_name] += 1
 
         # Check if container is available, if so, make it unavailable, otherwise cancel the deletion
         containers_removed_from_available = []
@@ -434,6 +460,9 @@ class ServerlessPlatform:
                 if container_name in available_instances[function_name]:
                     containers_removed_from_available.append((function_name, container_name))
                     available_instances[function_name].remove(container_name)
+
+                    pruned_count[function_name] += 1
+                    remaining_count[function_name] -= 1
         containers_to_delete = containers_removed_from_available
 
         # remove expired containers from instance_expirations
@@ -444,3 +473,8 @@ class ServerlessPlatform:
         # delete the containers
         for _, container_name in containers_to_delete:
             self._delete_container(container_name)
+
+        prune_properties["exit_time"] = time.time()
+        prune_properties["pruned_count"] = pruned_count
+        prune_properties["remaining_count"] = remaining_count
+        self._logger.info(prune_properties)
