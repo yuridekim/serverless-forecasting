@@ -6,7 +6,7 @@ from sf_platform import ServerlessPlatform
 import pandas as pd
 
 class ServerlessScheduler:
-    def __init__(self, platform: ServerlessPlatform, models: dict[str, Prophet], interval=10, default_warm_instances=0, default_warm_period=30, gen_pred=True):
+    def __init__(self, platform: ServerlessPlatform, models: dict[str, Prophet], interval=10, default_warm_instances=0, default_warm_period=10, gen_pred=True):
         """
         platform: Instance of ServerlessPlatform
         models: Map function names to Prophet models.

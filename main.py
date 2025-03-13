@@ -19,6 +19,7 @@ def new_prophet():
     return prophet
 
 async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, function_name: str):
+    df_instances = pd.DataFrame({"ds": [], "num": []})
     for idx, row in tqdm(df.iterrows()):
         target_time = row["ds"]
         value = row["y"]
@@ -30,7 +31,9 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
         for _ in range(int(value)):
             # print("RUNNING FUNCTION")
             asyncio.create_task(sch.platform.run_function(function_name, query_params="t=3.0"))
-            sch.platform._available_instances[function_name]
+        
+        # Add number of available instances at each time
+        df_instances.loc[len(df_instances)] = {"ds": target_time, "num": len(sch.platform._available_instances[function_name])}
 
         if (idx + 1) % 10 == 0: # idk whatever lmao
             new_model = new_prophet()
@@ -38,7 +41,9 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
             sch.models[function_name] = new_model
             asyncio.create_task(sch.adjust_scheduling())
 
-async def main(use_model=True):
+    return df_instances
+
+async def main(samples=100, use_model=True):
     sp = ServerlessPlatform()
     await sp.register_function("sleep", "./sf_platform/examples/sleep/entry.py", "./sf_platform/examples/sleep/requirements.txt")
 
@@ -46,13 +51,13 @@ async def main(use_model=True):
 
     # uncomment if you don't have the data
     # load_azure_data()
-    trace = preprocess_azure_data(num_samples=100, bin_size=1)
+    trace = preprocess_azure_data(num_samples=samples, bin_size=1)
     print(trace.head())
-    await process_trace_dataframe(scheduler, trace, "sleep")
+    instances = await process_trace_dataframe(scheduler, trace, "sleep")
     
     sp.shutdown()
 
-    return trace, sp, scheduler
+    return trace, scheduler, instances
 
 if __name__ == "__main__":
     asyncio.run(main())
