@@ -56,12 +56,15 @@ def retry_request(method: str, url: str,
                 method=method,
                 url=url,
                 headers=headers,
-                data=data
+                data=data,
+                timeout=10  # TODO: variable execution limits
             )
 
             # Consider the request successful if it doesn't raise an exception
             return response
-
+        except requests.Timeout:
+            # Do not try again if it began executing, but took too long to run
+            return None
         except requests.RequestException:
             # If request fails, wait and continue
             attempts += 1
@@ -315,6 +318,7 @@ class ServerlessPlatform:
                 detach=True,
                 name=container_name,
                 ports={'80/tcp': host_port},
+                read_only=True,  # stateless serverless are run on read-only FS
                 auto_remove=True,  # when Flask is stopped, remove the container (we never restart stopped containers)
             )
 
