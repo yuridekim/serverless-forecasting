@@ -30,7 +30,7 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
         
         for _ in range(int(value)):
             # print("RUNNING FUNCTION")
-            asyncio.create_task(sch.platform.run_function(function_name, query_params="t=3.0"))
+            asyncio.create_task(sch.platform.run_function(function_name, query_params="t=0.3"))
         
         # Add number of available instances at each time
         df_instances.loc[len(df_instances)] = {"ds": target_time, "num": len(sch.platform._available_instances[function_name])}
@@ -43,11 +43,11 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
 
     return df_instances
 
-async def main(samples=100, use_model=True):
-    sp = ServerlessPlatform()
+async def main(samples=100, warming_period=30, use_model=True):
+    sp = ServerlessPlatform(time_multiplier=10)
     await sp.register_function("sleep", "./sf_platform/examples/sleep/entry.py", "./sf_platform/examples/sleep/requirements.txt")
 
-    scheduler = ServerlessScheduler(sp, { "sleep": new_prophet() }, gen_pred=use_model)
+    scheduler = ServerlessScheduler(sp, { "sleep": new_prophet() }, gen_pred=use_model, default_warm_period=warming_period)
 
     # uncomment if you don't have the data
     # load_azure_data()

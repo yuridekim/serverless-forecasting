@@ -49,7 +49,7 @@ def preprocess_azure_data(azure_data_path = "data/AzureFunctionsInvocationTraceF
     print("Extracted function...")
 
     # define some reference time based on current
-    reference_time = pd.to_datetime(datetime.now() + timedelta(0, 10)) # add 10 seconds just because idk
+    reference_time = pd.to_datetime(datetime.now() + timedelta(0, 1)) # add 10 seconds just because idk
 
     # gather invocation counts by bucket size (in seconds)
     bins = range(0, int(single_function_df["start_timestamp"].max()) + bin_size, bin_size)
@@ -60,7 +60,7 @@ def preprocess_azure_data(azure_data_path = "data/AzureFunctionsInvocationTraceF
 
     # convert to proper timestamps for Prophet to use (and us, for comparisons to current time)
     train_df = bucket_counts.reset_index()
-    train_df["time_bucket"] = reference_time + pd.to_timedelta(train_df.index * bin_size, unit="s")
+    train_df["time_bucket"] = reference_time + (pd.to_timedelta(train_df.index * bin_size, unit="s") / 10)
     train_df = train_df.rename(columns={"time_bucket": "ds", "count": "y"})
 
     end_time = time.monotonic()

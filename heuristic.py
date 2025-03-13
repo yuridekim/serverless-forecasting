@@ -31,7 +31,7 @@ class ServerlessScheduler:
         try:
             # Ensure future timestamps align with per-second predictions
             last_timestamp = model.history['ds'].max()
-            future = pd.DataFrame({'ds': [last_timestamp + timedelta(seconds=i) for i in range(1, self.interval + 1)]})
+            future = pd.DataFrame({'ds': [last_timestamp + timedelta(milliseconds=100 * i) for i in range(1, self.interval + 1)]})
 
             # Generate forecast
             forecast = model.predict(future)
