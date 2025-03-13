@@ -1,7 +1,10 @@
 import asyncio
 import pandas as pd
 import logging
+
+from tqdm import tqdm
 logging.getLogger("prophet.plot").disabled = True
+logging.getLogger("cmdstanpy").disabled=True
 from prophet import Prophet
 from sf_platform import ServerlessPlatform
 from heuristic import ServerlessScheduler
@@ -16,7 +19,7 @@ def new_prophet():
     return prophet
 
 async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, function_name: str):
-    for idx, row in df.iterrows():
+    for idx, row in tqdm(df.iterrows()):
         target_time = row["ds"]
         value = row["y"]
 
@@ -25,8 +28,9 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
             await asyncio.sleep((target_time - now).total_seconds())
         
         for _ in range(int(value)):
-            print("RUNNING FUNCTION")
+            # print("RUNNING FUNCTION")
             asyncio.create_task(sch.platform.run_function(function_name, query_params="t=3.0"))
+            sch.platform._available_instances[function_name]
 
         if (idx + 1) % 10 == 0: # idk whatever lmao
             new_model = new_prophet()
@@ -34,11 +38,11 @@ async def process_trace_dataframe(sch: ServerlessScheduler, df: pd.DataFrame, fu
             sch.models[function_name] = new_model
             asyncio.create_task(sch.adjust_scheduling())
 
-async def main() -> None:
+async def main(use_model=True):
     sp = ServerlessPlatform()
     await sp.register_function("sleep", "./sf_platform/examples/sleep/entry.py", "./sf_platform/examples/sleep/requirements.txt")
 
-    scheduler = ServerlessScheduler(sp, { "sleep": new_prophet() })
+    scheduler = ServerlessScheduler(sp, { "sleep": new_prophet() }, gen_pred=use_model)
 
     # uncomment if you don't have the data
     # load_azure_data()
@@ -47,6 +51,8 @@ async def main() -> None:
     await process_trace_dataframe(scheduler, trace, "sleep")
     
     sp.shutdown()
+
+    return trace, sp, scheduler
 
 if __name__ == "__main__":
     asyncio.run(main())

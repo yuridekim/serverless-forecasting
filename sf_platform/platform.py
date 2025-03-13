@@ -86,8 +86,10 @@ class ServerlessPlatform:
     _default_warm_periods: ThreadSafeDict[str, int]  # Default warming period (s) for a non-permanently-warmed container
     _instance_expirations: ThreadSafeDict[str, dict[str, int]]  # Mapping from function to the expiration timestamps
     _available_instances: ThreadSafeDict[str, list[str]]  # Mapping from function name to available container names
-    _logger: logging.Logger  # Logger for tracing
-    _logging_queue_listener: QueueListener  # Queue handler for logger
+    # _logger: logging.Logger  # Logger for tracing
+    # _logging_queue_listener: QueueListener  # Queue handler for logger
+
+    logs: list[dict]
 
     def __init__(self, template_path: str = "sf_platform/template/", time_multiplier: float = 1.0):
         self._time_multiplier = time_multiplier
@@ -101,16 +103,18 @@ class ServerlessPlatform:
         self._instance_expirations = ThreadSafeDict()
         self._available_instances = ThreadSafeDict()
 
-        self._logger = logging.getLogger("ServerlessPlatform")
-        self._logger.setLevel(logging.INFO)
+        # self._logger = logging.getLogger("ServerlessPlatform")
+        # self._logger.setLevel(logging.INFO)
 
-        log_queue = queue.Queue()
-        queue_handler = QueueHandler(log_queue)
-        self._logger.addHandler(queue_handler)
+        # log_queue = queue.Queue()
+        # queue_handler = QueueHandler(log_queue)
+        # self._logger.addHandler(queue_handler)
 
-        stream_handler = logging.StreamHandler()  # Writes to stdout
-        self._logging_queue_listener = QueueListener(log_queue, stream_handler)
-        self._logging_queue_listener.start()
+        # stream_handler = logging.StreamHandler()  # Writes to stdout
+        # self._logging_queue_listener = QueueListener(log_queue, stream_handler)
+        # self._logging_queue_listener.start()
+
+        self.logs = []
 
         asyncio.create_task(self._prune())  # begin the pruning loop
 
@@ -236,7 +240,8 @@ class ServerlessPlatform:
         self._return_container(function_name, container_name)
         run_properties["container_release_time"] = time.time()
 
-        self._logger.info(run_properties)
+        # print(run_properties, flush=True)
+        self.logs.append(run_properties)
 
         if not response:
             raise Exception("Attempts to request data failed")
@@ -482,4 +487,6 @@ class ServerlessPlatform:
         prune_properties["exit_time"] = time.time()
         prune_properties["pruned_count"] = pruned_count
         prune_properties["remaining_count"] = remaining_count
-        self._logger.info(prune_properties)
+
+        # print(prune_properties, flush=True)
+        self.logs.append(prune_properties)
