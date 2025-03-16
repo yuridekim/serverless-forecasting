@@ -477,6 +477,9 @@ class ServerlessPlatform:
 
                     pruned_count[function_name] += 1
                     remaining_count[function_name] -= 1
+
+            remaining_and_available_count = {function_name: len(available)
+                                             for function_name, available in available_instances.items()}
         containers_to_delete = containers_removed_from_available
 
         # remove expired containers from instance_expirations
@@ -491,6 +494,7 @@ class ServerlessPlatform:
         prune_properties["exit_time"] = time.time()
         prune_properties["pruned_count"] = pruned_count
         prune_properties["remaining_count"] = remaining_count
+        prune_properties["remaining_and_available_count"] = remaining_and_available_count
 
         # print(prune_properties, flush=True)
         self.logs.append(prune_properties)
