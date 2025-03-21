@@ -131,7 +131,7 @@ class ServerlessSimulator:
             self._update_state(f, inv["start_timestamp"], with_model)
 
             # Get an available container—if none available, it's a cold start
-            is_warm_start, (a, e, r) = self._get_available_container(f)
+            is_warm_start, (a, e, r) = self._get_available_container(f, inv["duration"])
 
             # Log simulation data
             logs.loc[len(logs)] = {
@@ -284,7 +284,7 @@ class ServerlessSimulator:
                 np.random.normal(dist.execution[0], dist.execution[1]),
                 np.random.normal(dist.release[0], dist.release[1]))
     
-    def _get_available_container(self, f: str) -> tuple[bool, tuple[float, float, float]]:
+    def _get_available_container(self, f: str, duration: pd.Timedelta) -> tuple[bool, tuple[float, float, float]]:
         fun = self._functions[f]
 
         a, e, r = self._get_stats(False)
@@ -296,12 +296,12 @@ class ServerlessSimulator:
                 is_warm_start = True
                 a, e, r = self._get_stats(True)
                 cont.expiration = fun.cur_time + s(fun.warming_period)
-                cont.in_use_until = fun.cur_time + s(a + e + r)
+                cont.in_use_until = fun.cur_time + s(a + e + r) + duration
                 break
 
         # Couldn't find a container, had to create one
         if not is_warm_start:
-            fun.containers.append(Container(fun.cur_time + s(fun.warming_period), fun.cur_time + s(a + e + r)))
+            fun.containers.append(Container(fun.cur_time + s(fun.warming_period), fun.cur_time + s(a + e + r) + duration))
 
         return is_warm_start, (a, e, r)
 
