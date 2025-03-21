@@ -27,8 +27,10 @@ class Distribution:
 # Functions can be invoked using a container
 @dataclass
 class Container:
+    creation: pd.Timestamp
     expiration: pd.Timestamp
     in_use_until: pd.Timestamp
+    active_time: pd.Timedelta
 
 # Stores all metadata from an entire function's simulation
 @dataclass
@@ -112,6 +114,12 @@ class ServerlessSimulator:
                 "release_time": []
             })
 
+        container_logs = pd.DataFrame({
+            "creation": [],
+            "expiration": [],
+            "active_time": []
+        })
+
         invocations = self._invocations
         if func is not None:
             invocations = invocations[invocations["func"] == func]
@@ -128,7 +136,7 @@ class ServerlessSimulator:
             
             # Create history until current timestamp, add one invocation in the last bin
             # to signify that a function was run at this time
-            self._update_state(f, inv["start_timestamp"], with_model)
+            self._update_state(f, inv["start_timestamp"], with_model, container_logs)
 
             # Get an available container—if none available, it's a cold start
             is_warm_start, (a, e, r) = self._get_available_container(f, inv["duration"])
@@ -143,9 +151,11 @@ class ServerlessSimulator:
                 "release_time": fun.cur_time + s(a + e + r)
             }
 
-        return logs
+        self._cleanup(container_logs)
+
+        return logs, container_logs
     
-    def _update_state(self, f: str, timestamp: pd.Timestamp, with_model: bool):
+    def _update_state(self, f: str, timestamp: pd.Timestamp, with_model: bool, container_logs: pd.DataFrame):
         fun = self._functions[f]
 
         # This is the first invocation for this function; add it to the history
@@ -173,7 +183,7 @@ class ServerlessSimulator:
                 fun.history.loc[len(fun.history)] = {"ds": fun.cur_time, "y": 0, "available_containers": 0}
 
             # Based on warming period and min containers, prune (or create)
-            self._adjust_containers(f)
+            self._adjust_containers(f, container_logs)
             # If needed, fit a model to predict the next interval (and adjust the
             # warming period and min containers knobs as necessary)
             if with_model: self._adjust_model(f)
@@ -189,7 +199,7 @@ class ServerlessSimulator:
         fun.history.loc[len(fun.history) - 1, "y"] += 1
 
         # Adjust and fit model if necessary for the new timestamp
-        self._adjust_containers(f)
+        self._adjust_containers(f, container_logs)
         if with_model: self._adjust_model(f)
     
     def _adjust_model(self, f):
@@ -241,7 +251,7 @@ class ServerlessSimulator:
         # Keep log of these predictions
         fun.predictions.append(forecast)
 
-    def _adjust_containers(self, f):
+    def _adjust_containers(self, f, container_logs: pd.DataFrame):
         fun = self._functions[f]
 
         minw = fun.min_num_containers
@@ -250,6 +260,12 @@ class ServerlessSimulator:
         for cont in fun.containers:
             # If expired and not in use, remove it
             if cont.expiration <= fun.cur_time and cont.in_use_until <= fun.cur_time:
+                container_logs.loc[len(container_logs)] = {
+                    "creation": cont.creation,
+                    "expiration": cont.expiration,
+                    "active_time": cont.active_time
+                }
+
                 fun.containers.remove(cont)
 
             # Count the number of permanently warmed containers
@@ -257,7 +273,7 @@ class ServerlessSimulator:
                 # If reached the max, demote container to regular warming 
                 # period
                 if cw >= minw:
-                    cont.expiration = fun.cur_time + s(fun.warming_period)
+                    cont.expiration = fun.cur_time  # + s(fun.warming_period)
 
                 cw += 1
 
@@ -274,7 +290,11 @@ class ServerlessSimulator:
             # For the rest, create them
             if to_add > 0:
                 for _ in range(to_add):
-                    fun.containers.append(Container(fun.cur_time + s(fun.warming_period), pd.Timestamp(0)))
+                    fun.containers.append(
+                        Container(fun.cur_time,
+                                  MAX_TIMESTAMP, pd.Timestamp(0),
+                                  pd.Timedelta(seconds=0))
+                    )
                 
     def _get_stats(self, is_warm_start: bool) -> tuple[float, float, float]:
         dist = self._warm_start_dist if is_warm_start else self._cold_start_dist
@@ -297,11 +317,27 @@ class ServerlessSimulator:
                 a, e, r = self._get_stats(True)
                 cont.expiration = fun.cur_time + s(fun.warming_period)
                 cont.in_use_until = fun.cur_time + s(a + e + r) + duration
+                cont.active_time = cont.active_time + s(a + e + r) + duration
                 break
 
         # Couldn't find a container, had to create one
         if not is_warm_start:
-            fun.containers.append(Container(fun.cur_time + s(fun.warming_period), fun.cur_time + s(a + e + r) + duration))
+            fun.containers.append(
+                Container(fun.cur_time,
+                          fun.cur_time + s(fun.warming_period), fun.cur_time + s(a + e + r) + duration,
+                          s(a + e + r) + duration)
+            )
 
         return is_warm_start, (a, e, r)
 
+    def _cleanup(self, container_logs: pd.DataFrame) -> None:
+        """
+        Add final entries to container logs (those that haven't expired by the end of the simulation)
+        """
+        for function in self._functions.values():
+            for container in function.containers:
+                container_logs.loc[len(container_logs)] = {
+                    "creation": container.creation,
+                    "expiration": function.cur_time,  # expire everything upon destruction of the universe
+                    "active_time": container.active_time
+                }
