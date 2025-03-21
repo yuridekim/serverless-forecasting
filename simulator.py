@@ -37,13 +37,18 @@ class Container:
 class Function:
     warming_period: int
     min_num_containers: int
+    avg_invocation: pd.Timedelta
+    num_invocations: int = 0
     containers: list[Container] = field(default_factory=list)
     predictions: list[pd.DataFrame] = field(default_factory=list)
     history: pd.DataFrame = field(default_factory=
                                   lambda: pd.DataFrame({
                                       "ds": [], 
                                       "y": [], 
-                                      "available_containers": []}))
+                                      "available_containers": [],
+                                      "min_num_containers": [],
+                                      "warming_period": []
+                                      }))
     cur_time: pd.Timestamp = pd.Timestamp(0)
     last_predictor_update: pd.Timestamp = pd.Timestamp(0)
 
@@ -69,7 +74,7 @@ class ServerlessSimulator:
 
     # Knobs for prediction
     _predictor_interval: int
-    _predictor_history_interval: int
+    _predictor_history_samples: int
     _granularity: int
 
     def __init__(self, 
@@ -89,7 +94,7 @@ class ServerlessSimulator:
         self._default_warming_period = default_warming_period
         self._default_min_num_containers = default_min_num_containers
         self._predictor_interval = predictor_interval
-        self._predictor_history_interval = predictor_history_interval
+        self._predictor_history_samples = predictor_history_interval
         self._granularity = granularity
 
         self._functions = {}
@@ -129,14 +134,17 @@ class ServerlessSimulator:
 
         for _, inv in tqdm(invocations.iterrows(), total=len(invocations)):
             if inv["func"] not in self._functions.keys():
-                self._functions[inv["func"]] = Function(self._default_warming_period, self._default_min_num_containers)
+                # Initial avg invocation time is the execution overhead
+                self._functions[inv["func"]] = Function(self._default_warming_period,
+                                                        self._default_min_num_containers,
+                                                        s(self._cold_start_dist.execution[0]))
             
             f = inv["func"]
             fun = self._functions[f]
             
             # Create history until current timestamp, add one invocation in the last bin
             # to signify that a function was run at this time
-            self._update_state(f, inv["start_timestamp"], with_model, container_logs)
+            self._update_state(f, inv["start_timestamp"], inv["duration"], with_model, container_logs)
 
             # Get an available container—if none available, it's a cold start
             is_warm_start, (a, e, r) = self._get_available_container(f, inv["duration"])
@@ -155,55 +163,94 @@ class ServerlessSimulator:
 
         return logs, container_logs
     
-    def _update_state(self, f: str, timestamp: pd.Timestamp, with_model: bool, container_logs: pd.DataFrame):
+    def _update_state(self, f: str, timestamp: pd.Timestamp, duration: pd.Timedelta, with_model: bool, container_logs: pd.DataFrame):
         fun = self._functions[f]
 
-        # This is the first invocation for this function; add it to the history
-        # and set the current timestamp as the first bin
-        if len(fun.history) == 0:
-            fun.history.loc[0] = {"ds": timestamp.floor('1s'), "y": 0, "available_containers": 0}
-            fun.cur_time = timestamp.floor('1s')
-            fun.last_predictor_update = timestamp.floor('1s')
-
-        # Simulate strictly per second
-        fun.cur_time = fun.cur_time.floor('1s')
-
-        # Get the last time bin in this function's history
-        last = fun.history.loc[len(fun.history) - 1]
-
-        # Determine the number of bins needed to "catch up" to the latest 
-        # invocation
-        ints = math.floor((timestamp.timestamp() - last['ds'].timestamp()) / self._granularity) + 1
-
-        # For each bin (including the current one) until the latest timestamp
-        for i in range(ints):
-            # This not the current bin, so we need to add a bin to "catch up"
-            if i != 0:
-                fun.cur_time += s(self._granularity)
-                fun.history.loc[len(fun.history)] = {"ds": fun.cur_time, "y": 0, "available_containers": 0}
-
-            # Based on warming period and min containers, prune (or create)
-            self._adjust_containers(f, container_logs)
-            # If needed, fit a model to predict the next interval (and adjust the
-            # warming period and min containers knobs as necessary)
-            if with_model: self._adjust_model(f)
-
-            # Log the number of warmed containers
-            conts = fun.history.loc[len(fun.history) - 1, "available_containers"]
-            fun.history.loc[len(fun.history) - 1, "available_containers"] = max(conts, len(fun.containers))
-
-        # For posterity, set the current timestamp to the non rounded version
+        # Set the current timestamp
         fun.cur_time = timestamp
+
+        # Based on warming period and min containers, prune (or create)
+        self._adjust_containers(f, container_logs)
+
+        # If needed, fit a model to predict the next interval (and adjust the
+        # warming period and min containers knobs as necessary)
+        if with_model: self._adjust_model(f)
+
+        # Check if this new invocation is not within the last bin (or no history at all)
+        if (len(fun.history) == 0 or 
+            timestamp.timestamp() - fun.history.loc[len(fun.history) - 1]['ds'].timestamp() 
+            >= self._granularity):
+
+            fun.history.loc[len(fun.history)] = {"ds": timestamp, 
+                                                 "y": 0, 
+                                                 "available_containers": 0, 
+                                                 "min_num_containers": 0, 
+                                                 "warming_period": 0}
 
         # Add an invocation to our logs
         fun.history.loc[len(fun.history) - 1, "y"] += 1
 
-        # Adjust and fit model if necessary for the new timestamp
-        self._adjust_containers(f, container_logs)
-        if with_model: self._adjust_model(f)
+        # Log the number of warmed containers
+        conts = fun.history.loc[len(fun.history) - 1, "available_containers"]
+        fun.history.loc[len(fun.history) - 1, "available_containers"] = max(conts, len(fun.containers))
+        fun.history.loc[len(fun.history) - 1, "min_num_containers"] = fun.min_num_containers
+        fun.history.loc[len(fun.history) - 1, "warming_period"] = fun.warming_period
+
+        # Update average invocation length
+        fun.avg_invocation = (fun.avg_invocation * fun.num_invocations) + duration
+        fun.num_invocations += 1
+        fun.avg_invocation /= fun.num_invocations
+
+        # # This is the first invocation for this function; add it to the history
+        # # and set the current timestamp as the first bin
+        # if len(fun.history) == 0:
+        #     fun.history.loc[0] = {"ds": timestamp.floor('1s'), "y": 0, "available_containers": 0}
+        #     fun.cur_time = timestamp.floor('1s')
+        #     fun.last_predictor_update = timestamp.floor('1s')
+
+        # # Simulate strictly per second
+        # fun.cur_time = fun.cur_time.floor('1s')
+
+        # # Get the last time bin in this function's history
+        # last = fun.history.loc[len(fun.history) - 1]
+
+        # # Determine the number of bins needed to "catch up" to the latest 
+        # # invocation
+        # ints = math.floor((timestamp.timestamp() - last['ds'].timestamp()) / self._granularity) + 1
+
+        # # For each bin (including the current one) until the latest timestamp
+        # for i in range(ints):
+        #     # This not the current bin, so we need to add a bin to "catch up"
+        #     if i != 0:
+        #         fun.cur_time += s(self._granularity)
+        #         fun.history.loc[len(fun.history)] = {"ds": fun.cur_time, "y": 0, "available_containers": 0}
+
+        #     # Based on warming period and min containers, prune (or create)
+        #     self._adjust_containers(f, container_logs)
+        #     # If needed, fit a model to predict the next interval (and adjust the
+        #     # warming period and min containers knobs as necessary)
+        #     if with_model: self._adjust_model(f)
+
+        #     # Log the number of warmed containers
+        #     conts = fun.history.loc[len(fun.history) - 1, "available_containers"]
+        #     fun.history.loc[len(fun.history) - 1, "available_containers"] = max(conts, len(fun.containers))
+
+        # # For posterity, set the current timestamp to the non rounded version
+        # fun.cur_time = timestamp
+
+        # # Add an invocation to our logs
+        # fun.history.loc[len(fun.history) - 1, "y"] += 1
+
+        # # Adjust and fit model if necessary for the new timestamp
+        # self._adjust_containers(f, container_logs)
+        # if with_model: self._adjust_model(f)
     
     def _adjust_model(self, f):
         fun = self._functions[f]
+
+        # Check if there's enough data to make a prediction
+        if len(fun.history) < 5:
+            return
 
         # Check if the model is due for an update
         if fun.cur_time - fun.last_predictor_update < s(self._predictor_interval):
@@ -216,12 +263,11 @@ class ServerlessSimulator:
         prophet.add_seasonality(name="minute_level", period=3600, fourier_order=5)
 
         # Fit it to the past history interval
-        hist = fun.history.iloc[max(0, len(fun.history) - self._predictor_history_interval):]
+        hist = fun.history.iloc[max(0, len(fun.history) - self._predictor_history_samples):]
         prophet.fit(hist)
 
         # Get the future DataFrame to predict
-        last = fun.history.loc[len(fun.history) - 1]
-        future = pd.DataFrame({'ds': [last['ds'] + timedelta(seconds=i * self._granularity) 
+        future = pd.DataFrame({'ds': [fun.cur_time + timedelta(seconds=i * self._granularity) 
                                       for i in range(1, self._predictor_interval // self._granularity + 1)]})
 
         # Run prediction model and filter by future timestamps
@@ -239,8 +285,9 @@ class ServerlessSimulator:
         invocation_counts = {row['ds']: max(0, row['yhat']) for _, row in forecast.iterrows()}
 
         # Set the number of warmed to the maximum forecasted number of 
-        # invocations
+        # invocations (adjusted for average invocation time)
         max_concurrent = max(invocation_counts.values(), default=0)
+        max_concurrent /= self._granularity
         fun.min_num_containers = int(round(max_concurrent))
 
         # Get the number of active bins (interval where invocation > 0) and 
