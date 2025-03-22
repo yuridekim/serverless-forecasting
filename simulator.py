@@ -155,8 +155,8 @@ class ServerlessSimulator:
                 "func": f, 
                 "is_warm_start": is_warm_start,
                 "acquire_time": fun.cur_time + s(a),
-                "execute_time": fun.cur_time + s(a + e),
-                "release_time": fun.cur_time + s(a + e + r)
+                "execute_time": fun.cur_time + s(a + e) + inv["duration"],
+                "release_time": fun.cur_time + s(a + e + r) + inv["duration"]
             }
 
         self._cleanup(container_logs)
